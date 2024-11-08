@@ -1,0 +1,36 @@
+2024-10-18 00:28:10,532 - ERROR - Task exception was never retrieved
+future: <Task finished name='Task-1' coro=<run_bot() done, defined at C:\Users\polat\Desktop\KAZNU\4\Search Systems\telegram_banking_bot\bot.py:46> exception=RuntimeError('Cannot close a running event loop')>
+Traceback (most recent call last):
+  File "C:\Users\polat\AppData\Local\Programs\Python\Python311\Lib\site-packages\telegram\ext\_application.py", line 1079, in __run
+    loop.run_until_complete(self.initialize())
+  File "C:\Users\polat\AppData\Local\Programs\Python\Python311\Lib\asyncio\base_events.py", line 630, in run_until_complete
+    self._check_running()
+  File "C:\Users\polat\AppData\Local\Programs\Python\Python311\Lib\asyncio\base_events.py", line 589, in _check_running
+    raise RuntimeError('This event loop is already running')
+RuntimeError: This event loop is already running
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "C:\Users\polat\AppData\Local\Programs\Python\Python311\Lib\site-packages\telegram\ext\_application.py", line 1104, in __run
+    loop.run_until_complete(self.shutdown())
+  File "C:\Users\polat\AppData\Local\Programs\Python\Python311\Lib\asyncio\base_events.py", line 630, in run_until_complete
+    self._check_running()
+  File "C:\Users\polat\AppData\Local\Programs\Python\Python311\Lib\asyncio\base_events.py", line 589, in _check_running
+    raise RuntimeError('This event loop is already running')
+RuntimeError: This event loop is already running
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "C:\Users\polat\Desktop\KAZNU\4\Search Systems\telegram_banking_bot\bot.py", line 55, in run_bot
+    await application.run_polling()
+          ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\polat\AppData\Local\Programs\Python\Python311\Lib\site-packages\telegram\ext\_application.py", line 881, in run_polling
+    return self.__run(
+           ^^^^^^^^^^^
+  File "C:\Users\polat\AppData\Local\Programs\Python\Python311\Lib\site-packages\telegram\ext\_application.py", line 1109, in __run
+    loop.close()
+  File "C:\Users\polat\AppData\Local\Programs\Python\Python311\Lib\asyncio\proactor_events.py", line 686, in close
+    raise RuntimeError("Cannot close a running event loop")
+RuntimeError: Cannot close a running event loop
