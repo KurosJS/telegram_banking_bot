@@ -29,6 +29,7 @@ This project is a simple banking system Telegram bot that allows users to manage
 
 ## Features to add
 - Editing user's information (number, name, account number etc.)
+- Splitting bot.py to different .py files for better readability!
 
 
 ## Setup
