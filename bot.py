@@ -29,7 +29,7 @@ def get_db_connection():
 router = Router()
 
 # limit for loans
-LOAN_LIMIT = 45000
+LOAN_LIMIT = 50000
 
 # state classes
 class Registration(StatesGroup):
@@ -37,32 +37,109 @@ class Registration(StatesGroup):
     waiting_for_email = State()
     waiting_for_phone = State()
 
+
 class Transaction(StatesGroup):
     waiting_for_transaction_type = State()
     waiting_for_amount = State()
+
 
 class Transfer(StatesGroup):
     waiting_for_transaction_type = State()
     waiting_for_recipient_phone = State()
     waiting_for_transfer_amount = State()
+    waiting_for_recipient_account = State()
+
 
 class Loan(StatesGroup):
     waiting_for_amount = State()
     waiting_for_duration = State()
     confirming_loan = State()
 
+
 class LoanPayment(StatesGroup):
     viewing_loan_details = State()
     choosing_payment_option = State()
     paying_amount = State()
 
+
+# Input validation functions
+def is_valid_name(name):
+    return len(name.strip()) > 0
+
+
+def is_valid_email(email):
+    return re.match(r'^[\w\.-]+@[\w\.-]+\.\w+$', email) is not None
+
+
+def is_valid_phone(phone: str) -> bool:
+    """
+    Validate if the phone number is in a valid format.
+    Accepts numbers with optional '+' prefix and 10-15 digits.
+    """
+    return re.match(r'^\+?[0-9]{10,15}$', phone) is not None
+
+def normalize_phone_number(phone: str) -> str:
+    """
+    Normalizes phone numbers to a standard format (without '+' and country code normalized to '7').
+    Examples:
+        '+7702-------' -> '7702-------'
+        '8702-------'  -> '7702-------'
+        '702-------'   -> '7702-------'
+    """
+    phone = re.sub(r'\D', '', phone)  # Remove non-numeric characters
+    if phone.startswith('8'):        # Replace leading '8' with '7' (Kazakhstan standard)
+        phone = '7' + phone[1:]
+    elif phone.startswith('7') and len(phone) == 10:
+        phone = '7' + phone  # Add missing country code
+    return phone
+
+
+def is_positive_amount(amount):
+    try:
+        return float(amount) > 0
+    except ValueError:
+        return False
+
+# Check if a user is already registered
+def is_user_registered(telegram_id):
+    connection = get_db_connection()
+    cursor = connection.cursor()
+    cursor.execute('SELECT * FROM users WHERE id = ?', (telegram_id,))
+    user = cursor.fetchone()
+    connection.close()
+    return user
+
+
+async def show_main_menu(message: Message):
+    reply_keyboard = [
+        [KeyboardButton(text='ℹ️ My Info')],
+        [KeyboardButton(text='💸 Take a Loan'), KeyboardButton(text='🎁 Donate to Charity')],
+        [KeyboardButton(text='💵 Deposit'), KeyboardButton(text='📤 Transfer')],
+        [KeyboardButton(text='📅 Pay Monthly Loan')]
+    ]
+    markup = ReplyKeyboardMarkup(keyboard=reply_keyboard, resize_keyboard=True)
+    await message.answer("✅ Back to Main state", reply_markup=markup)
+
 # Cancel button on keyboards
 cancel_button = KeyboardButton(text="❌ Cancel")
+
+
+def create_cancel_keyboard():
+    """Utility to create a keyboard with the cancel button."""
+    return ReplyKeyboardMarkup(
+        keyboard=[[cancel_button]],
+        resize_keyboard=True
+    )
 
 # Utility to handle cancel action and return to main menu
 async def handle_cancel(message: Message, state: FSMContext):
     await state.clear()
     await show_main_menu(message)
+
+
+@router.message(F.text == "❌ Cancel")
+async def cancel_action_handler(message: Message, state: FSMContext):
+    await handle_cancel(message, state)
 
 
 # Handler for taking a loan
@@ -82,9 +159,9 @@ async def initiate_loan(message: Message, state: FSMContext):
 
     loan_summary = (
         f"📊 Current Loan Status:\n"
-        f"🔻 Total Outstanding: {total_outstanding} ₸\n"
-        f"📅 Monthly Payment: {monthly_payment} ₸\n\n"
-        "Enter loan amount (max 45,000 ₸) or press Cancel."
+        f"🔻 Total Outstanding: {total_outstanding:.2f} ₸\n"
+        f"📅 Monthly Payment: {monthly_payment:.2f} ₸\n\n"
+        "Enter loan amount (50,000 ₸ overall limitation, 23% annual interest) or press Cancel."
     )
     markup = ReplyKeyboardMarkup(
         keyboard=[[cancel_button]],
@@ -100,14 +177,14 @@ async def process_loan_amount(message: Message, state: FSMContext):
         await handle_cancel(message, state)
         return
 
-    amount_text = message.text
+    amount_text = message.text.strip()
     if not is_positive_amount(amount_text):
         await message.answer("❌ Invalid amount. Please enter a positive number.")
         return
 
     amount = float(amount_text)
     if amount > LOAN_LIMIT:
-        await message.answer("❌ Loan amount exceeds the individual limit of 45,000 ₸.")
+        await message.answer(f"❌ Loan amount exceeds the individual limit of {LOAN_LIMIT} ₸.")
         return
 
     try:
@@ -115,7 +192,7 @@ async def process_loan_amount(message: Message, state: FSMContext):
         cursor = connection.cursor()
         cursor.execute("SELECT SUM(remainingBalance) FROM loans WHERE userId = ?", (message.from_user.id,))
         total_outstanding = cursor.fetchone()[0] or 0
-        if total_outstanding + amount > 50000:
+        if total_outstanding + amount > LOAN_LIMIT:
             await message.answer("❌ Total loan balance cannot exceed 50,000 ₸.")
             return
     except sqlite3.Error as e:
@@ -133,12 +210,11 @@ async def process_loan_amount(message: Message, state: FSMContext):
     await message.answer("Select loan duration or press Cancel:", reply_markup=markup)
     await state.set_state(Loan.waiting_for_duration)
 
-# Process loan duration
+
 @router.message(Loan.waiting_for_duration)
 async def process_loan_duration(message: Message, state: FSMContext):
     if message.text == "❌ Cancel":
-        await message.answer("✅ Loan process canceled.")
-        await state.clear()
+        await handle_cancel(message, state)
         return
 
     durations = {"3 months": 3, "6 months": 6, "12 months": 12}
@@ -155,44 +231,47 @@ async def process_loan_duration(message: Message, state: FSMContext):
     total_repayment = loan_amount * (1 + interest_rate * (duration / 12))
     monthly_payment = total_repayment / duration
 
-    await state.update_data(loan_duration=duration, monthly_payment=monthly_payment, total_repayment=total_repayment)
+    # Update state with loan details
+    await state.update_data(
+        loan_duration=duration,
+        monthly_payment=monthly_payment,
+        total_repayment=total_repayment,
+        remaining_months=duration  # Track remaining months
+    )
+
+    cancel_keyboard = ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="❌ Cancel")]],
+        resize_keyboard=True
+    )
+
     await message.answer(
         f"📊 Loan Details:\n"
         f"💰 Loan Amount: {loan_amount:.2f} ₸\n"
         f"🗓️ Duration: {duration} months\n"
         f"📅 Monthly Payment: {monthly_payment:.2f} ₸\n"
-        f"🔻 Total Repayment: {total_repayment:.2f} ₸\n\n"
-        "Confirm loan? (Yes/No)"
+        f"🔻 Total Repayment (with interest): {total_repayment:.2f} ₸\n\n"
+        "Confirm loan? (Yes/No)",
+        reply_markup=cancel_keyboard
     )
     await state.set_state(Loan.confirming_loan)
-
-async def show_main_menu(message: Message):
-    reply_keyboard = [
-        [KeyboardButton(text='ℹ️ My Info')],
-        [KeyboardButton(text='💸 Take a Loan'), KeyboardButton(text='🎁 Donate to Charity')],
-        [KeyboardButton(text='💵 Deposit'), KeyboardButton(text='📤 Transfer')],
-        [KeyboardButton(text='📅 Pay Monthly Loan')]
-    ]
-    markup = ReplyKeyboardMarkup(keyboard=reply_keyboard, resize_keyboard=True)
-    await message.answer("✅ Main Menu", reply_markup=markup)
-
 
 @router.message(Loan.confirming_loan)
 async def confirm_loan(message: Message, state: FSMContext):
     if message.text.lower() == 'cancel':
         await message.answer("Loan request canceled.")
         await state.clear()
-        await show_main_menu(message)  # Show the main menu
+        await show_main_menu(message)
         return
 
     if message.text.lower() != 'yes':
-        await message.answer("Invalid response. Please type 'Yes' to confirm or 'Cancel' to exit.")
+        await message.answer("❌ Invalid response. Please type 'Yes' to confirm or 'Cancel' to exit.")
         return
 
     loan_data = await state.get_data()
     loan_amount = loan_data['loan_amount']
     monthly_payment = loan_data['monthly_payment']
     duration = loan_data['loan_duration']
+    remaining_months = loan_data['remaining_months']
     telegram_id = message.from_user.id
 
     try:
@@ -204,8 +283,8 @@ async def confirm_loan(message: Message, state: FSMContext):
         
         # Record the loan details
         cursor.execute(
-            'INSERT INTO loans (userId, loanAmount, durationMonths, monthlyPayment, remainingBalance) VALUES (?, ?, ?, ?, ?)',
-            (telegram_id, loan_amount, duration, monthly_payment, loan_amount)
+            'INSERT INTO loans (userId, loanAmount, durationMonths, monthlyPayment, remainingBalance, remainingMonths) VALUES (?, ?, ?, ?, ?, ?)',
+            (telegram_id, loan_amount, duration, monthly_payment, loan_amount, remaining_months)
         )
 
         # Record the transaction
@@ -215,40 +294,15 @@ async def confirm_loan(message: Message, state: FSMContext):
         )
 
         connection.commit()
-        await message.answer(f"Loan confirmed. You have received {loan_amount} ₸. Monthly payment: {monthly_payment:.2f} ₸.")
+        await message.answer(f"✅ Loan confirmed. You have received {loan_amount:.2f} ₸.\n"
+                             f"📅 Monthly payment: {monthly_payment:.2f} ₸.")
     except sqlite3.Error as e:
         await message.answer(f"❌ Loan confirmation failed: {e}")
     finally:
         connection.close()
 
-    await state.clear()  # Clear the state
-    await show_main_menu(message)  # Show the main menu
-
-
-# Input validation functions
-def is_valid_name(name):
-    return len(name.strip()) > 0
-
-def is_valid_email(email):
-    return re.match(r'^[\w\.-]+@[\w\.-]+\.\w+$', email) is not None
-
-def is_valid_phone(phone):
-    return phone.isdigit() and 10 <= len(phone) <= 15
-
-def is_positive_amount(amount):
-    try:
-        return float(amount) > 0
-    except ValueError:
-        return False
-
-# Check if a user is already registered
-def is_user_registered(telegram_id):
-    connection = get_db_connection()
-    cursor = connection.cursor()
-    cursor.execute('SELECT * FROM users WHERE id = ?', (telegram_id,))
-    user = cursor.fetchone()
-    connection.close()
-    return user
+    await state.clear()
+    await show_main_menu(message)
 
 # /start command handler
 @router.message(Command(commands=['start']))
@@ -273,14 +327,6 @@ async def start_bot(message: Message):
 @router.message(Command(commands=['register']))
 async def register_user(message: Message, state: FSMContext):
     telegram_id = message.from_user.id
-    if is_user_registered(telegram_id):
-        reply_keyboard = [
-            [KeyboardButton(text='💳 Check Balance'), KeyboardButton(text='ℹ️ My Info')],
-            [KeyboardButton(text='💸 Take a Loan'), KeyboardButton(text='🎁 Donate to Charity')]
-        ]
-        markup = ReplyKeyboardMarkup(keyboard=reply_keyboard, resize_keyboard=True, one_time_keyboard=True)
-        await message.answer("You are already registered. What would you like to do?", reply_markup=markup)
-        return
     await message.answer("Please provide your name.")
     await state.update_data(telegram_id=telegram_id)
     await state.set_state(Registration.waiting_for_name)
@@ -301,7 +347,7 @@ async def process_name(message: Message, state: FSMContext):
     await message.answer("Thank you! Now, please provide your email.")
     await state.set_state(Registration.waiting_for_email)
 
-# Handle email input
+
 @router.message(Registration.waiting_for_email)
 async def process_email(message: Message, state: FSMContext):
     email = message.text
@@ -312,26 +358,33 @@ async def process_email(message: Message, state: FSMContext):
     await message.answer("Now, please provide your phone number.")
     await state.set_state(Registration.waiting_for_phone)
 
-# Handle phone input and finalize registration
+
 @router.message(Registration.waiting_for_phone)
 async def process_phone(message: Message, state: FSMContext):
-    phone = message.text
+    phone = message.text.strip()
     if not is_valid_phone(phone):
         await message.answer("❌ Invalid phone number. Please enter a valid phone number.")
         return
+    
     user_data = await state.get_data()
     name = user_data['name']
     email = user_data['email']
     telegram_id = user_data['telegram_id']
+    
     try:
         connection = get_db_connection()
         cursor = connection.cursor()
-        cursor.execute('INSERT INTO users (id, name, email, phone) VALUES (?, ?, ?, ?)', (telegram_id, name, email, phone))
+        cursor.execute(
+            'INSERT INTO users (id, name, email, phone) VALUES (?, ?, ?, ?)',
+            (telegram_id, name, email, phone)
+        )
         account_number = f"ACC{telegram_id}"
         initial_balance = 0.0
-        cursor.execute('INSERT INTO accounts (userId, accountNumber, accountType, balance) VALUES (?, ?, ?, ?)', (telegram_id, account_number, 'savings', initial_balance))
+        cursor.execute(
+            'INSERT INTO accounts (userId, accountNumber, accountType, balance) VALUES (?, ?, ?, ?)',
+            (telegram_id, account_number, 'savings', initial_balance)
+        )
         connection.commit()
-        connection.close()
         await message.answer(f"✅ Registration completed for {name}! Your account number is {account_number}.")
     except sqlite3.IntegrityError as e:
         await message.answer(f"❌ Registration failed: {e}")
@@ -339,13 +392,20 @@ async def process_phone(message: Message, state: FSMContext):
         await message.answer(f"❌ Database error: {e}")
     finally:
         connection.close()
+    
+    # Clear state
     await state.clear()
+    
+    # Display the keyboard for registered users
     reply_keyboard = [
-        [KeyboardButton(text='💳 Check Balance'), KeyboardButton(text='ℹ️ My Info')],
-        [KeyboardButton(text='💸 Take a Loan'), KeyboardButton(text='🎁 Donate to Charity')]
+        [KeyboardButton(text='ℹ️ My Info')],
+        [KeyboardButton(text='💸 Take a Loan'), KeyboardButton(text='🎁 Donate to Charity')],
+        [KeyboardButton(text='💵 Deposit'), KeyboardButton(text='📤 Transfer')],
+        [KeyboardButton(text='📅 Pay Monthly Loan')]
     ]
-    markup = ReplyKeyboardMarkup(keyboard=reply_keyboard, resize_keyboard=True, one_time_keyboard=False)
+    markup = ReplyKeyboardMarkup(keyboard=reply_keyboard, resize_keyboard=True, one_time_keyboard=True)
     await message.answer("What would you like to do next?", reply_markup=markup)
+
 
 @router.message(Loan.waiting_for_amount)
 async def process_loan_amount(message: Message, state: FSMContext):
@@ -377,23 +437,56 @@ async def process_loan_amount(message: Message, state: FSMContext):
     await state.set_state(Loan.waiting_for_duration)
     connection.close()
 
-# Check user info handler
 @router.message(F.text == 'ℹ️ My Info')
 async def get_user_info(message: Message):
     try:
         telegram_id = message.from_user.id
         connection = get_db_connection()
         cursor = connection.cursor()
+
+        # Fetch user details
         cursor.execute('SELECT name, email FROM users WHERE id = ?', (telegram_id,))
         user_info = cursor.fetchone()
+
+        # Fetch account details
         cursor.execute('SELECT accountNumber, balance FROM accounts WHERE userId = ?', (telegram_id,))
         account_info = cursor.fetchone()
+
+        # Fetch loan details
+        cursor.execute(
+            'SELECT SUM(loanAmount), MAX(remainingMonths) FROM loans WHERE userId = ?',
+            (telegram_id,)
+        )
+        loan_info = cursor.fetchone()
+        total_loan_amount, months_left = loan_info if loan_info else (0, 0)
+
         if user_info and account_info:
             name, email = user_info
             account_number, balance = account_info
-            await message.answer(f"ℹ️ Your Info:\nName: {name}\nEmail: {email}\nAccount Number: {account_number}\nBalance: {balance} ₸.")
+
+            # Build response message
+            info_message = (
+                f"ℹ️ Your Info:\n"
+                f"👤 Name: {name}\n"
+                f"📧 Email: {email}\n"
+                f"💳 Account Number: {account_number}\n"
+                f"💰 Balance: {balance:.2f} ₸\n"
+            )
+
+            # Include loan details if applicable
+            if total_loan_amount > 0:
+                info_message += (
+                    f"🔻 Total Loan Amount: {total_loan_amount:.2f} ₸\n"
+                    f"🗓️ Months Left: {months_left} months\n"
+                )
+            else:
+                info_message += "✔️ You have no outstanding loans.\n"
+
+            # Send the message
+            await message.answer(info_message)
         else:
             await message.answer("No information found. Please register first.")
+
         connection.close()
     except sqlite3.Error as e:
         await message.answer(f"Failed to retrieve your info: {e}")
@@ -462,53 +555,102 @@ async def initiate_deposit(message: Message, state: FSMContext):
 # Transfer by phone or account number
 @router.message(F.text == '📤 Transfer')
 async def initiate_transfer(message: Message, state: FSMContext):
-    transfer_options = [
-        [KeyboardButton(text="📱 By Phone"), KeyboardButton(text="🧾 By Account Number")],
-        [cancel_button]
-    ]
-    markup = ReplyKeyboardMarkup(keyboard=transfer_options, resize_keyboard=True)
+    markup = ReplyKeyboardMarkup(
+    keyboard=[[KeyboardButton(text="📱 By Phone"), KeyboardButton(text="🧾 By Account Number")], [cancel_button]],
+    resize_keyboard=True
+)
     await message.answer("Choose transfer method:", reply_markup=markup)
     await state.set_state(Transfer.waiting_for_transaction_type)
+
 
 @router.message(Transfer.waiting_for_transaction_type)
 async def choose_transfer_method(message: Message, state: FSMContext):
     if message.text == "❌ Cancel":
-        await message.answer("✅ Transfer process canceled.")
-        await state.clear()
+        await handle_cancel(message, state)
         return
 
     if message.text == "📱 By Phone":
         await state.update_data(transfer_method="phone")
-        await message.answer("Enter the recipient's phone number:")
+        await message.answer("Enter the recipient's phone number:", reply_markup=create_cancel_keyboard())
         await state.set_state(Transfer.waiting_for_recipient_phone)
     elif message.text == "🧾 By Account Number":
         await state.update_data(transfer_method="account")
-        await message.answer("Enter the recipient's account number:")
-        await state.set_state(Transfer.waiting_for_recipient_phone)
+        await message.answer("Enter the recipient's account number:", reply_markup=create_cancel_keyboard())
+        await state.set_state(Transfer.waiting_for_recipient_account)
     else:
         await message.answer("❌ Invalid option. Please choose a valid method.")
 
+
 @router.message(Transfer.waiting_for_recipient_phone)
-async def get_transfer_recipient(message: Message, state: FSMContext):
-    recipient_phone = message.text
+async def get_transfer_recipient_phone(message: Message, state: FSMContext):
+    if message.text == "❌ Cancel":
+        await handle_cancel(message, state)
+        return
+
+    # Normalize the phone number
+    recipient_phone = normalize_phone_number(message.text.strip())
+    
+    # Query the database for the recipient
     connection = get_db_connection()
     cursor = connection.cursor()
     cursor.execute('SELECT id, name FROM users WHERE phone = ?', (recipient_phone,))
     recipient = cursor.fetchone()
     connection.close()
-    
+
     if recipient:
         recipient_id, recipient_name = recipient
-        await state.update_data(recipient_id=recipient_id, recipient_name=recipient_name)  # Store recipient details
-        await message.answer(f"Recipient: {recipient_name}\nEnter the transfer amount:")
+        await state.update_data(recipient_id=recipient_id, recipient_name=recipient_name)
+        await message.answer(
+            f"Recipient: {recipient_name}\nEnter the transfer amount:",
+            reply_markup=create_cancel_keyboard()
+        )
         await state.set_state(Transfer.waiting_for_transfer_amount)
     else:
         await message.answer("❌ No user found with that phone number.")
-        await state.clear()
+
+
+@router.message(Transfer.waiting_for_recipient_account)
+async def get_transfer_recipient_account(message: Message, state: FSMContext):
+    if message.text == "❌ Cancel":
+        await handle_cancel(message, state)
+        return
+
+    account_number = message.text.strip()
+
+    # Validate account number format (e.g., starts with 'ACC' followed by digits)
+    if not re.match(r'^ACC\d+$', account_number):
+        await message.answer("❌ Invalid account number. Please enter a valid account number starting with 'ACC' followed by digits.")
+        return
+
+    connection = get_db_connection()
+    cursor = connection.cursor()
+    cursor.execute('SELECT userId FROM accounts WHERE accountNumber = ?', (account_number,))
+    recipient = cursor.fetchone()
+    connection.close()
+
+    if recipient:
+        recipient_id = recipient[0]
+        await state.update_data(recipient_account=account_number, recipient_id=recipient_id)
+
+        # Create cancel keyboard dynamically using the existing cancel_button
+        cancel_keyboard = ReplyKeyboardMarkup(
+            keyboard=[[cancel_button]],
+            resize_keyboard=True
+        )
+
+        await message.answer("Enter the transfer amount:", reply_markup=cancel_keyboard)
+        await state.set_state(Transfer.waiting_for_transfer_amount)
+    else:
+        await message.answer("❌ No account found with that account number.")
+
 
 @router.message(Transfer.waiting_for_transfer_amount)
 async def process_transfer_amount(message: Message, state: FSMContext):
-    amount_text = message.text
+    if message.text == "❌ Cancel":
+        await handle_cancel(message, state)
+        return
+
+    amount_text = message.text.strip()
     if not is_positive_amount(amount_text):
         await message.answer("❌ Invalid amount. Please enter a positive number.")
         return
@@ -516,38 +658,40 @@ async def process_transfer_amount(message: Message, state: FSMContext):
     amount = float(amount_text)
     user_data = await state.get_data()
     telegram_id = message.from_user.id
-    recipient_id = user_data['recipient_id']
-    recipient_name = user_data['recipient_name']  # Access recipient name from state data
+    recipient_id = user_data.get("recipient_id")
+    recipient_name = user_data.get("recipient_name")  # Access recipient name from state data
 
     try:
         connection = get_db_connection()
         cursor = connection.cursor()
-        
+
         # Fetch sender's balance
         cursor.execute('SELECT balance FROM accounts WHERE userId = ?', (telegram_id,))
         sender_balance = cursor.fetchone()[0]
-        
+
         if sender_balance < amount:
             await message.answer("❌ Insufficient balance for this transfer.")
             return
 
         # Deduct from sender's balance
         cursor.execute('UPDATE accounts SET balance = balance - ? WHERE userId = ?', (amount, telegram_id))
-        
+
         # Add to recipient's balance
         cursor.execute('UPDATE accounts SET balance = balance + ? WHERE userId = ?', (amount, recipient_id))
 
         # Record transactions for both parties
         cursor.execute('INSERT INTO transactions (accountId, amount, transactionType) VALUES (?, ?, ?)', (telegram_id, -amount, 'Transfer Out'))
         cursor.execute('INSERT INTO transactions (accountId, amount, transactionType) VALUES (?, ?, ?)', (recipient_id, amount, 'Transfer In'))
-        
-        connection.commit()
-        
-        await message.answer(f"📤 Transfer of {amount} ₸ sent to {recipient_name} successfully.")
 
-        # Send a notification to the recipient
-        recipient_telegram_id = recipient_id  # Assuming recipient_id is also their Telegram ID
-        await bot.send_message(recipient_telegram_id, f"💰 You have received a transfer of {amount} ₸ from {message.from_user.full_name}.")
+        connection.commit()
+
+        # Notify the recipient
+        await bot.send_message(
+            recipient_id,
+            f"💰 You have received a transfer of {amount:.2f} ₸ from {message.from_user.full_name}."
+        )
+
+        await message.answer(f"📤 Transfer of {amount:.2f} ₸ sent to {recipient_name} successfully.")
 
     except sqlite3.Error as e:
         await message.answer(f"❌ Transfer failed: {e}")
@@ -555,6 +699,22 @@ async def process_transfer_amount(message: Message, state: FSMContext):
         connection.close()
 
     await state.clear()
+    await show_main_menu(message)
+
+
+@router.message(LoanPayment.paying_amount)
+async def handle_custom_payment(message: Message, state: FSMContext):
+    amount_text = message.text.strip()
+    
+    # Validate the entered amount
+    if not is_positive_amount(amount_text):
+        await message.answer("❌ Invalid amount. Please enter a positive number.")
+        return
+
+    custom_amount = float(amount_text)
+    
+    # Call the process_payment function for custom payment
+    await process_payment(message, state, amount_type="custom", amount=custom_amount)
 
 
 async def process_payment(message: Message, state: FSMContext, amount_type=None, amount=None):
@@ -634,7 +794,6 @@ async def process_payment(message: Message, state: FSMContext, amount_type=None,
     await show_main_menu(message)
 
 
-
 @router.message(F.text == '📅 Pay Monthly Loan')
 async def initiate_loan_payment(message: Message, state: FSMContext):
     telegram_id = message.from_user.id
@@ -644,10 +803,16 @@ async def initiate_loan_payment(message: Message, state: FSMContext):
 
         # Fetch loan details
         cursor.execute(
-            "SELECT SUM(remainingBalance), SUM(monthlyPayment), SUM(loanAmount) FROM loans WHERE userId = ?",
+            "SELECT remainingBalance, monthlyPayment, durationMonths, remainingMonths FROM loans WHERE userId = ?",
             (telegram_id,)
         )
-        total_loan_balance, monthly_payment, total_loan = cursor.fetchone() or (0, 0, 0)
+        loan_details = cursor.fetchone()
+
+        if not loan_details:
+            await message.answer("❌ You have no outstanding loans.")
+            return
+
+        total_loan_balance, monthly_payment, duration_months, remaining_months = loan_details
 
         # Fetch user's account balance
         cursor.execute("SELECT balance FROM accounts WHERE userId = ?", (telegram_id,))
@@ -659,16 +824,12 @@ async def initiate_loan_payment(message: Message, state: FSMContext):
     finally:
         connection.close()
 
-    if total_loan_balance <= 0:
-        await message.answer("❌ You have no outstanding loans.")
-        return
-
     # Construct loan summary message
     loan_summary = (
         f"📊 Loan Summary:\n"
-        f"🔻 Total Loan Amount: {total_loan:.2f} ₸\n"
-        f"📅 Monthly Payment: {monthly_payment:.2f} ₸\n"
         f"🔸 Remaining Loan Balance: {total_loan_balance:.2f} ₸\n"
+        f"📅 Monthly Payment: {monthly_payment:.2f} ₸\n"
+        f"🗓️ Remaining Months: {remaining_months} months\n"
         f"💵 Your Account Balance: {user_balance:.2f} ₸\n\n"
         "Choose an option to proceed:"
     )
@@ -707,21 +868,111 @@ async def choose_payment_option(message: Message, state: FSMContext):
         await process_payment(message, state, amount_type="monthly")
     elif payment_type == "custom":
         await message.answer("Enter the custom amount to pay:")
-        await state.set_state(Transaction.waiting_for_amount)
+        await state.set_state(LoanPayment.paying_amount)
     elif payment_type == "full":
         await process_payment(message, state, amount_type="full")
 
 
-@router.message(LoanPayment.paying_amount)
-async def pay_custom_amount(message: Message, state: FSMContext):
-    amount_text = message.text
-    if not is_positive_amount(amount_text):
-        await message.answer("❌ Invalid amount. Please enter a positive number.")
-        return
+async def process_payment(message: Message, state: FSMContext, amount_type=None, amount=None):
+    telegram_id = message.from_user.id
+    try:
+        connection = get_db_connection()
+        cursor = connection.cursor()
 
-    custom_amount = float(amount_text)
-    await process_payment(message, state, amount=custom_amount)
+        # Fetch loan details
+        cursor.execute(
+            "SELECT remainingBalance, monthlyPayment, durationMonths, remainingMonths FROM loans WHERE userId = ?",
+            (telegram_id,)
+        )
+        loan_details = cursor.fetchone()
 
+        if not loan_details:
+            await message.answer("❌ You have no outstanding loans.")
+            return
+
+        total_loan_balance, monthly_payment, duration_months, remaining_months = loan_details
+
+        # Fetch user's account balance
+        cursor.execute("SELECT balance FROM accounts WHERE userId = ?", (telegram_id,))
+        user_balance = cursor.fetchone()[0] or 0
+
+        # Determine payment amount based on the type
+        if amount_type == "monthly":
+            payment_amount = monthly_payment
+            remaining_months = max(remaining_months - 1, 0)  # Decrement remaining months for monthly payments
+        elif amount_type == "full":
+            payment_amount = total_loan_balance
+            remaining_months = 0  # Fully repaid
+        elif amount_type == "custom":
+            if amount > total_loan_balance:
+                await message.answer(f"❌ Payment amount ({amount:.2f} ₸) exceeds the remaining loan balance ({total_loan_balance:.2f} ₸).")
+                return
+            payment_amount = amount
+            new_remaining_balance = total_loan_balance - payment_amount
+            if new_remaining_balance == 0:
+                remaining_months = 0  # Loan fully repaid
+            else:
+                # Update monthly payment if balance remains
+                monthly_payment = new_remaining_balance / remaining_months
+        else:
+            await message.answer("❌ Invalid payment type.")
+            return
+
+        # Ensure sufficient balance for payment
+        if payment_amount > user_balance:
+            await message.answer(f"❌ Insufficient funds. Your account balance is {user_balance:.2f} ₸.")
+            return
+
+        # Deduct payment from the loan balance
+        new_remaining_balance = max(total_loan_balance - payment_amount, 0)
+
+        # Deduct payment from the user's account balance
+        new_user_balance = user_balance - payment_amount
+
+        # Update loan details
+        cursor.execute(
+            """
+            UPDATE loans
+            SET remainingBalance = ?, remainingMonths = ?, monthlyPayment = ?
+            WHERE userId = ?
+            """,
+            (new_remaining_balance, remaining_months, monthly_payment if new_remaining_balance > 0 else 0, telegram_id)
+        )
+
+        # Update user's account balance
+        cursor.execute(
+            "UPDATE accounts SET balance = ? WHERE userId = ?",
+            (new_user_balance, telegram_id)
+        )
+
+        # Record the transaction
+        cursor.execute(
+            "INSERT INTO transactions (accountId, amount, transactionType) VALUES (?, ?, ?)",
+            (telegram_id, -payment_amount, "Loan Payment")
+        )
+
+        connection.commit()
+
+        # Notify the user of the successful payment
+        message_details = (
+            f"✅ Payment of {payment_amount:.2f} ₸ processed successfully.\n"
+            f"💵 Updated Account Balance: {new_user_balance:.2f} ₸\n"
+            f"🔸 Remaining Loan Balance: {new_remaining_balance:.2f} ₸\n"
+        )
+        if remaining_months > 0:
+            message_details += f"🗓️ Remaining Months: {remaining_months} months."
+        else:
+            message_details += "🎉 Your loan is fully repaid!"
+
+        await message.answer(message_details)
+
+    except sqlite3.Error as e:
+        await message.answer(f"❌ Payment failed due to a database error: {e}")
+    finally:
+        connection.close()
+
+    await state.clear()
+    await show_main_menu(message)
 
 # Main entry point
 async def main():

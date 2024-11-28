@@ -49,6 +49,7 @@ def initialize_database():
             durationMonths INTEGER NOT NULL CHECK (durationMonths IN (3, 6, 12)),
             monthlyPayment REAL NOT NULL CHECK (monthlyPayment > 0),
             remainingBalance REAL NOT NULL CHECK (remainingBalance >= 0),
+            remainingMonths INTEGER NOT NULL CHECK (remainingMonths >= 0),
             FOREIGN KEY (userId) REFERENCES users(id)
         )
     ''')

@@ -19,8 +19,17 @@ This project is a simple banking system Telegram bot that allows users to manage
 
 ## Features
 - Create a new user
-- Check account balance
-- Deposit money to an account
+- Check info
+- Deposit money to an account (way of gaining balance using the bot)
+- Donate to charity (way of lowering balance using the bot)
+- Take a loan
+- Pay the loans (in different ways)
+- Transfers by phone number
+- Transfers by account number
+
+## Features to add
+- Editing user's information (number, name, account number etc.)
+
 
 ## Setup
 1. Clone the repository:
