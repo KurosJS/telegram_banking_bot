@@ -142,41 +142,63 @@ async def cancel_action_handler(message: Message, state: FSMContext):
     await handle_cancel(message, state)
 
 
-# Handler for taking a loan
 @router.message(F.text == '💸 Take a Loan')
 async def initiate_loan(message: Message, state: FSMContext):
     telegram_id = message.from_user.id
     try:
         connection = get_db_connection()
         cursor = connection.cursor()
-        cursor.execute("SELECT SUM(remainingBalance), SUM(monthlyPayment) FROM loans WHERE userId = ?", (telegram_id,))
-        total_outstanding, monthly_payment = cursor.fetchone() or (0, 0)
+
+        # Check if the user has any active loans
+        cursor.execute("SELECT remainingBalance FROM loans WHERE userId = ? AND remainingBalance > 0", (telegram_id,))
+        active_loan = cursor.fetchone()
+
+        if active_loan:
+            await message.answer(
+                "❌ You already have an active loan. Please repay it before requesting a new one."
+            )
+            return
+
+        # No active loan; proceed with the loan request
+        await message.answer(
+            "📊 You are eligible for a loan. Enter the loan amount "
+            f"(up to {LOAN_LIMIT} ₸, with 23% annual interest):",
+            reply_markup=create_cancel_keyboard()
+        )
+        await state.set_state(Loan.waiting_for_amount)
+
     except sqlite3.Error as e:
-        await message.answer(f"❌ Error fetching loan data: {e}")
-        return
+        await message.answer(f"❌ Error checking loan eligibility: {e}")
     finally:
         connection.close()
-
-    loan_summary = (
-        f"📊 Current Loan Status:\n"
-        f"🔻 Total Outstanding: {total_outstanding:.2f} ₸\n"
-        f"📅 Monthly Payment: {monthly_payment:.2f} ₸\n\n"
-        "Enter loan amount (50,000 ₸ overall limitation, 23% annual interest) or press Cancel."
-    )
-    markup = ReplyKeyboardMarkup(
-        keyboard=[[cancel_button]],
-        resize_keyboard=True
-    )
-    await message.answer(loan_summary, reply_markup=markup)
-    await state.set_state(Loan.waiting_for_amount)
 
 
 @router.message(Loan.waiting_for_amount)
 async def process_loan_amount(message: Message, state: FSMContext):
-    if message.text == "❌ Cancel":
-        await handle_cancel(message, state)
-        return
+    telegram_id = message.from_user.id
 
+    try:
+        connection = get_db_connection()
+        cursor = connection.cursor()
+
+        # Check if the user has any active loans
+        cursor.execute("SELECT remainingBalance FROM loans WHERE userId = ? AND remainingBalance > 0", (telegram_id,))
+        active_loan = cursor.fetchone()
+
+        if active_loan:
+            await message.answer(
+                "❌ You already have an active loan. Please repay it before requesting a new one."
+            )
+            await handle_cancel(message, state)
+            return
+
+    except sqlite3.Error as e:
+        await message.answer(f"❌ Error checking active loans: {e}")
+        return
+    finally:
+        connection.close()
+
+    # Validate loan amount
     amount_text = message.text.strip()
     if not is_positive_amount(amount_text):
         await message.answer("❌ Invalid amount. Please enter a positive number.")
@@ -184,24 +206,12 @@ async def process_loan_amount(message: Message, state: FSMContext):
 
     amount = float(amount_text)
     if amount > LOAN_LIMIT:
-        await message.answer(f"❌ Loan amount exceeds the individual limit of {LOAN_LIMIT} ₸.")
+        await message.answer(f"❌ Loan amount exceeds the limit of {LOAN_LIMIT} ₸.")
         return
-
-    try:
-        connection = get_db_connection()
-        cursor = connection.cursor()
-        cursor.execute("SELECT SUM(remainingBalance) FROM loans WHERE userId = ?", (message.from_user.id,))
-        total_outstanding = cursor.fetchone()[0] or 0
-        if total_outstanding + amount > LOAN_LIMIT:
-            await message.answer("❌ Total loan balance cannot exceed 50,000 ₸.")
-            return
-    except sqlite3.Error as e:
-        await message.answer(f"❌ Error checking loan limits: {e}")
-        return
-    finally:
-        connection.close()
 
     await state.update_data(loan_amount=amount)
+
+    # Offer loan duration options
     durations_keyboard = [
         [KeyboardButton(text="3 months"), KeyboardButton(text="6 months")],
         [KeyboardButton(text="12 months"), cancel_button]
@@ -258,9 +268,7 @@ async def process_loan_duration(message: Message, state: FSMContext):
 @router.message(Loan.confirming_loan)
 async def confirm_loan(message: Message, state: FSMContext):
     if message.text.lower() == 'cancel':
-        await message.answer("Loan request canceled.")
-        await state.clear()
-        await show_main_menu(message)
+        await handle_cancel(message, state)
         return
 
     if message.text.lower() != 'yes':
@@ -277,15 +285,27 @@ async def confirm_loan(message: Message, state: FSMContext):
     try:
         connection = get_db_connection()
         cursor = connection.cursor()
-        
-        # Update the user's account balance
-        cursor.execute('UPDATE accounts SET balance = balance + ? WHERE userId = ?', (loan_amount, telegram_id))
-        
+
+        # Check again for any active loans
+        cursor.execute("SELECT remainingBalance FROM loans WHERE userId = ? AND remainingBalance > 0", (telegram_id,))
+        active_loan = cursor.fetchone()
+
+        if active_loan:
+            await message.answer(
+                "❌ You already have an active loan. Please repay it before requesting a new one."
+            )
+            await handle_cancel(message, state)
+            return
+
         # Record the loan details
         cursor.execute(
-            'INSERT INTO loans (userId, loanAmount, durationMonths, monthlyPayment, remainingBalance, remainingMonths) VALUES (?, ?, ?, ?, ?, ?)',
+            'INSERT INTO loans (userId, loanAmount, durationMonths, monthlyPayment, remainingBalance, remainingMonths) '
+            'VALUES (?, ?, ?, ?, ?, ?)',
             (telegram_id, loan_amount, duration, monthly_payment, loan_amount, remaining_months)
         )
+
+        # Update the user's account balance
+        cursor.execute('UPDATE accounts SET balance = balance + ? WHERE userId = ?', (loan_amount, telegram_id))
 
         # Record the transaction
         cursor.execute(
@@ -294,8 +314,11 @@ async def confirm_loan(message: Message, state: FSMContext):
         )
 
         connection.commit()
-        await message.answer(f"✅ Loan confirmed. You have received {loan_amount:.2f} ₸.\n"
-                             f"📅 Monthly payment: {monthly_payment:.2f} ₸.")
+        await message.answer(
+            f"✅ Loan confirmed. You have received {loan_amount:.2f} ₸.\n"
+            f"📅 Monthly payment: {monthly_payment:.2f} ₸."
+        )
+
     except sqlite3.Error as e:
         await message.answer(f"❌ Loan confirmation failed: {e}")
     finally:
@@ -452,13 +475,17 @@ async def get_user_info(message: Message):
         cursor.execute('SELECT accountNumber, balance FROM accounts WHERE userId = ?', (telegram_id,))
         account_info = cursor.fetchone()
 
-        # Fetch loan details
+        # Fetch loan details for unpaid loans only
         cursor.execute(
-            'SELECT SUM(loanAmount), MAX(remainingMonths) FROM loans WHERE userId = ?',
+            '''
+            SELECT SUM(loanAmount), MAX(remainingMonths)
+            FROM loans
+            WHERE userId = ? AND remainingBalance > 0
+            ''',
             (telegram_id,)
         )
         loan_info = cursor.fetchone()
-        total_loan_amount, months_left = loan_info if loan_info else (0, 0)
+        total_loan_amount, months_left = loan_info if loan_info else (0, None)
 
         if user_info and account_info:
             name, email = user_info
@@ -474,10 +501,10 @@ async def get_user_info(message: Message):
             )
 
             # Include loan details if applicable
-            if total_loan_amount > 0:
+            if total_loan_amount and months_left:
                 info_message += (
                     f"🔻 Total Loan Amount: {total_loan_amount:.2f} ₸\n"
-                    f"🗓️ Months Left: {months_left} months\n"
+                    f"🗓️ Max Months Left to Pay: {months_left} months\n"
                 )
             else:
                 info_message += "✔️ You have no outstanding loans.\n"
@@ -801,22 +828,20 @@ async def initiate_loan_payment(message: Message, state: FSMContext):
         connection = get_db_connection()
         cursor = connection.cursor()
 
-        # Fetch loan details
+        # Fetch all loans with remaining balance > 0
         cursor.execute(
-            "SELECT remainingBalance, monthlyPayment, durationMonths, remainingMonths FROM loans WHERE userId = ?",
+            """
+            SELECT id, remainingBalance, monthlyPayment, remainingMonths
+            FROM loans
+            WHERE userId = ? AND remainingBalance > 0
+            """,
             (telegram_id,)
         )
-        loan_details = cursor.fetchone()
+        unpaid_loans = cursor.fetchall()
 
-        if not loan_details:
+        if not unpaid_loans:
             await message.answer("❌ You have no outstanding loans.")
             return
-
-        total_loan_balance, monthly_payment, duration_months, remaining_months = loan_details
-
-        # Fetch user's account balance
-        cursor.execute("SELECT balance FROM accounts WHERE userId = ?", (telegram_id,))
-        user_balance = cursor.fetchone()[0] or 0
 
     except sqlite3.Error as e:
         await message.answer(f"❌ Error retrieving loan or account details: {e}")
@@ -824,24 +849,23 @@ async def initiate_loan_payment(message: Message, state: FSMContext):
     finally:
         connection.close()
 
-    # Construct loan summary message
-    loan_summary = (
-        f"📊 Loan Summary:\n"
-        f"🔸 Remaining Loan Balance: {total_loan_balance:.2f} ₸\n"
-        f"📅 Monthly Payment: {monthly_payment:.2f} ₸\n"
-        f"🗓️ Remaining Months: {remaining_months} months\n"
-        f"💵 Your Account Balance: {user_balance:.2f} ₸\n\n"
-        "Choose an option to proceed:"
-    )
+    # Construct loan options for selection
+    loan_summary = "📊 Select a Loan to Pay:\n"
+    loan_buttons = []
+    for i, (loan_id, remaining_balance, monthly_payment, remaining_months) in enumerate(unpaid_loans, start=1):
+        loan_summary += (
+            f"{i}️⃣ Loan #{i}:\n"
+            f"🔸 Remaining Balance: {remaining_balance:.2f} ₸\n"
+            f"📅 Monthly Payment: {monthly_payment:.2f} ₸\n"
+            f"🗓️ Remaining Months: {remaining_months}\n\n"
+        )
+        loan_buttons.append([KeyboardButton(text=f"Loan #{i}")])
 
-    # Display options to the user
-    options_keyboard = [
-        [KeyboardButton(text="📅 Pay Monthly"), KeyboardButton(text="💵 Pay Full")],
-        [KeyboardButton(text="✏️ Pay Custom Amount"), cancel_button]
-    ]
-    markup = ReplyKeyboardMarkup(keyboard=options_keyboard, resize_keyboard=True)
-
+    markup = ReplyKeyboardMarkup(keyboard=loan_buttons + [[cancel_button]], resize_keyboard=True)
     await message.answer(loan_summary, reply_markup=markup)
+
+    # Save loans in state for reference
+    await state.update_data(unpaid_loans=unpaid_loans)
     await state.set_state(Transaction.waiting_for_transaction_type)
 
 
@@ -879,13 +903,17 @@ async def process_payment(message: Message, state: FSMContext, amount_type=None,
         connection = get_db_connection()
         cursor = connection.cursor()
 
-        # Fetch loan details
+        # Fetch loan details with remaining balance > 0
         cursor.execute(
-            "SELECT remainingBalance, monthlyPayment, durationMonths, remainingMonths FROM loans WHERE userId = ?",
+            "SELECT remainingBalance, monthlyPayment, durationMonths, remainingMonths FROM loans WHERE userId = ? AND remainingBalance > 0",
             (telegram_id,)
         )
         loan_details = cursor.fetchone()
 
+        # Log the fetched loan details for debugging
+        logging.info(f"Loan details fetched: {loan_details}")
+
+        # If no active loan with remaining balance
         if not loan_details:
             await message.answer("❌ You have no outstanding loans.")
             return
@@ -899,10 +927,10 @@ async def process_payment(message: Message, state: FSMContext, amount_type=None,
         # Determine payment amount based on the type
         if amount_type == "monthly":
             payment_amount = monthly_payment
-            remaining_months = max(remaining_months - 1, 0)  # Decrement remaining months for monthly payments
+            remaining_months = max(remaining_months - 1, 0)
         elif amount_type == "full":
             payment_amount = total_loan_balance
-            remaining_months = 0  # Fully repaid
+            remaining_months = 0
         elif amount_type == "custom":
             if amount > total_loan_balance:
                 await message.answer(f"❌ Payment amount ({amount:.2f} ₸) exceeds the remaining loan balance ({total_loan_balance:.2f} ₸).")
@@ -910,9 +938,8 @@ async def process_payment(message: Message, state: FSMContext, amount_type=None,
             payment_amount = amount
             new_remaining_balance = total_loan_balance - payment_amount
             if new_remaining_balance == 0:
-                remaining_months = 0  # Loan fully repaid
+                remaining_months = 0
             else:
-                # Update monthly payment if balance remains
                 monthly_payment = new_remaining_balance / remaining_months
         else:
             await message.answer("❌ Invalid payment type.")
@@ -934,7 +961,7 @@ async def process_payment(message: Message, state: FSMContext, amount_type=None,
             """
             UPDATE loans
             SET remainingBalance = ?, remainingMonths = ?, monthlyPayment = ?
-            WHERE userId = ?
+            WHERE userId = ? AND remainingBalance > 0
             """,
             (new_remaining_balance, remaining_months, monthly_payment if new_remaining_balance > 0 else 0, telegram_id)
         )
